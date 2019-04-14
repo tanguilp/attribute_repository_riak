@@ -212,7 +212,6 @@ defmodule AttributeRepositoryRiak do
   @impl AttributeRepository.Search
 
   def search(filter, attributes, run_opts) do
-    IO.inspect(build_riak_filter(filter))
 
     case Riak.Search.query(index_name(run_opts), build_riak_filter(filter)) do
       {:ok, {:search_results, result_list, _, _}} ->
@@ -232,6 +231,9 @@ defmodule AttributeRepositoryRiak do
       {:error, reason} ->
         {:error, AttributeRepository.ReadError.exception(inspect(reason))}
     end
+  rescue
+    e in AttributeRepository.UnsupportedError ->
+      {:error, e}
   end
 
   defp id_from_search_result(result_attributes) do
@@ -316,7 +318,7 @@ defmodule AttributeRepositoryRiak do
   defp build_riak_filter({:eq, %AttributePath{
     attribute: attribute,
     sub_attribute: nil
-  }, value})
+  }, value}) when is_boolean(value) or is_integer(value)
   do
     riak_attribute_name(attribute, value) <> ":" <> to_string(value)
   end
@@ -329,7 +331,7 @@ defmodule AttributeRepositoryRiak do
   defp build_riak_filter({:ge, %AttributePath{
     attribute: attribute,
     sub_attribute: nil
-  }, value})
+  }, value}) when is_binary(value) or is_integer(value)
   do
     riak_attribute_name(attribute, value) <> ":[" <> to_string(value) <> " TO *]"
   end
@@ -337,7 +339,7 @@ defmodule AttributeRepositoryRiak do
   defp build_riak_filter({:le, %AttributePath{
     attribute: attribute,
     sub_attribute: nil
-  }, value})
+  }, value}) when is_binary(value) or is_integer(value)
   do
     riak_attribute_name(attribute, value) <> ":[* TO " <> to_string(value) <> "]"
   end
@@ -345,7 +347,7 @@ defmodule AttributeRepositoryRiak do
   defp build_riak_filter({:gt, %AttributePath{
     attribute: attribute,
     sub_attribute: nil
-  } = attribute_path, value})
+  } = attribute_path, value}) when is_binary(value) or is_integer(value)
   do
     riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
     "(*:* NOT " <> build_riak_filter({:le, attribute_path, value}) <> ")"
@@ -354,7 +356,7 @@ defmodule AttributeRepositoryRiak do
   defp build_riak_filter({:lt, %AttributePath{
     attribute: attribute,
     sub_attribute: nil
-  } = attribute_path, value})
+  } = attribute_path, value}) when is_binary(value) or is_integer(value)
   do
     riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
     "(*:* NOT " <> build_riak_filter({:ge, attribute_path, value}) <> ")"
@@ -387,6 +389,22 @@ defmodule AttributeRepositoryRiak do
       attribute <> "_set:*" <> to_string(value) # special case to handle equality in sets
   end
 
+  defp build_riak_filter({_, _, value}) when is_float(value) or is_nil(value) do
+    raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
+  end
+
+  defp build_riak_filter({_, _, %DateTime{}}) do
+    raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
+  end
+
+  defp build_riak_filter({_, _, {:binary_data, _}}) do
+    raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
+  end
+
+  defp build_riak_filter({_, _, {:ref, _, _}}) do
+    raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
+  end
+
   defp riak_attribute_name(name, value) when is_binary(value), do: name <> "_register"
   defp riak_attribute_name(name, value) when is_boolean(value), do: name <> "_flag"
   defp riak_attribute_name(name, value) when is_integer(value), do: name <> "_counter"
@@ -410,10 +428,6 @@ defmodule AttributeRepositoryRiak do
   defp to_riak_crdt(value) when is_integer(value) do
     Riak.CRDT.Counter.new()
     |> Riak.CRDT.Counter.increment(value)
-  end
-
-  defp to_riak_crdt(nil) do
-    Riak.CRDT.Register.new(nil)
   end
 
   defp to_riak_crdt(value) when is_list(value) do
