@@ -1,18 +1,456 @@
 defmodule AttributeRepositoryRiak do
   @moduledoc """
-  Documentation for AttributeRepositoryRiak.
+
+  ## Initializing a bucket type for attribute repository
+
+  ```sh
+  $ sudo riak-admin bucket-type create attr_rep '{"props":{"datatype":"map", "backend":"leveldb_mult"}}'
+  attr_rep created
+
+  $ sudo riak-admin bucket-type activate attr_rep
+  attr_rep has been activated
+
+  ```
+
+
+  ## Options
+
+  ### run options (`run_opts`)
+  - `:instance`: instance name (an `atom()`)
+  - `:bucket_type`: a `String.t()` for the bucket type that must be created beforehand
   """
 
-  @doc """
-  Hello world.
+  require Logger
 
-  ## Examples
+  alias AttributeRepository.Search.AttributePath
 
-      iex> AttributeRepositoryRiak.hello()
-      :world
+  use AttributeRepository.Read
+  use AttributeRepository.Write
+  use AttributeRepository.Search
 
-  """
-  def hello do
-    :world
+  @behaviour AttributeRepository.Install
+  @behaviour AttributeRepository.Read
+  @behaviour AttributeRepository.Write
+  @behaviour AttributeRepository.Search
+
+  @impl AttributeRepository.Install
+
+  def install(run_opts, _init_opts) do
+    :ok = Riak.Search.Index.put(index_name(run_opts))
+
+    :ok = Riak.Search.Index.set({run_opts[:bucket_type], bucket_name(run_opts)},
+                                index_name(run_opts))
+  end
+
+  @impl AttributeRepository.Read
+
+  def get(resource_id, attributes, run_opts) do
+    case Riak.find(run_opts[:bucket_type], bucket_name(run_opts), resource_id) do
+      nil ->
+        {:error, AttributeRepository.Read.NotFoundError.exception("Entry not found")}
+
+      attribute_list ->
+        {
+          :ok,
+          Enum.reduce(
+            Riak.CRDT.Map.value(attribute_list),
+            %{},
+            fn
+              {{attribute_name, _attribute_type}, attribute_value}, acc ->
+                if attributes == :all or attribute_name in attributes do
+                  Map.put(acc, attribute_name, attribute_value)
+                else
+                  acc
+                end
+            end
+          )
+        }
+    end
+  end
+
+  @impl AttributeRepository.Write
+
+  def put(resource_id, resource, run_opts) do
+    new_base_obj =
+      case Riak.find(run_opts[:bucket_type], bucket_name(run_opts), resource_id) do
+        obj when not is_nil(obj) ->
+          #FIXME: mwe may not need to keep the same object in the case of repacement:
+          # just deleting it and creating a new could be enough?
+          # There would be however a short time with no object
+          Enum.reduce(
+            Riak.CRDT.Map.keys(obj),
+            obj,
+            fn
+              {key, type}, acc ->
+                Riak.CRDT.Map.delete(acc, {key, type})
+            end
+          )
+
+        nil ->
+          Riak.CRDT.Map.new()
+      end
+
+    riak_res =
+      Enum.reduce(
+        resource,
+        new_base_obj,
+        fn
+          {key, value}, acc ->
+            Riak.CRDT.Map.put(acc, key, to_riak_crdt(value))
+        end
+      )
+
+    case Riak.update(riak_res, run_opts[:bucket_type], bucket_name(run_opts), resource_id) do
+      :ok ->
+        {:ok, resource}
+
+      _ ->
+        {:error, AttributeRepository.WriteError.exception("Write error")}
+    end
+  end
+
+  @impl AttributeRepository.Write
+
+  def modify(resource_id, modify_ops, run_opts) do
+    case Riak.find(run_opts[:bucket_type], bucket_name(run_opts), resource_id) do
+      obj when not is_nil(obj) ->
+        modified_obj =
+          Enum.reduce(
+            modify_ops,
+            obj,
+            fn
+              {:add, attribute_name, attribute_value}, acc ->
+                Riak.CRDT.Map.put(acc, attribute_name, to_riak_crdt(attribute_value))
+
+              {:replace, attribute_name, value}, acc ->
+                try do
+                  Riak.CRDT.Map.update(acc,
+                                       :set,
+                                       attribute_name,
+                                       fn
+                                         set ->
+                                           set =
+                                             Enum.reduce(
+                                               Riak.CRDT.Set.value(set),
+                                               set,
+                                               fn
+                                                 val, acc ->
+                                                   Riak.CRDT.Set.delete(acc, val)
+                                               end
+                                             )
+
+                                           Riak.CRDT.Set.put(set, value)
+                                       end)
+                rescue
+                  _ ->
+                    Riak.CRDT.Map.put(acc, attribute_name, to_riak_crdt(value))
+                end
+
+              {:replace, attribute_name, old_value, new_value}, acc ->
+                try do
+                  Riak.CRDT.Map.update(acc,
+                                       :set,
+                                       attribute_name,
+                                       fn
+                                         set ->
+                                           set
+                                           |> Riak.CRDT.Set.delete(old_value)
+                                           |> Riak.CRDT.Set.put(new_value)
+                                       end)
+                rescue
+                  _ ->
+                    Riak.CRDT.Map.put(acc, attribute_name, to_riak_crdt(new_value))
+                end
+
+              {:delete, attribute_name}, acc ->
+                case map_entry_data_type_of_key(obj, attribute_name) do
+                  data_type when not is_nil(data_type) ->
+                    Riak.CRDT.Map.delete(acc, {attribute_name, data_type})
+
+                  nil ->
+                    acc
+                end
+
+              {:delete, attribute_name, attribute_value}, acc ->
+                try do
+                  Riak.CRDT.Map.update(acc,
+                                       :set,
+                                       attribute_name,
+                                       fn
+                                         obj ->
+                                           Riak.CRDT.Set.delete(obj, attribute_value)
+                                       end)
+                rescue
+                  _ ->
+                    acc
+                end
+            end
+          )
+
+        case Riak.update(modified_obj,
+                         run_opts[:bucket_type],
+                         bucket_name(run_opts),
+                         resource_id) do
+          :ok ->
+            :ok
+
+          _ ->
+            {:error, AttributeRepository.WriteError.exception("Write error")}
+        end
+
+      nil ->
+        {:error, AttributeRepository.Read.NotFoundError.exception("Entry not found")}
+    end
+  end
+
+  @impl AttributeRepository.Write
+
+  def delete(resource_id, run_opts) do
+    Riak.delete(run_opts[:bucket_type], bucket_name(run_opts), resource_id)
+  end
+
+  @impl AttributeRepository.Search
+
+  def search(filter, attributes, run_opts) do
+    IO.inspect(build_riak_filter(filter))
+
+    case Riak.Search.query(index_name(run_opts), build_riak_filter(filter)) do
+      {:ok, {:search_results, result_list, _, _}} ->
+        for {_index_name, result_attributes} <- result_list do
+          {
+            id_from_search_result(result_attributes),
+            Enum.reduce(
+              result_attributes,
+              %{},
+              fn {attribute_name, attribute_value}, acc ->
+                to_search_result_map(acc, attribute_name, attribute_value, attributes)
+              end
+            )
+          }
+        end
+
+      {:error, reason} ->
+        {:error, AttributeRepository.ReadError.exception(inspect(reason))}
+    end
+  end
+
+  defp id_from_search_result(result_attributes) do
+    :proplists.get_value("_yz_id", result_attributes)
+    |> String.split("*")
+    |> Enum.at(3)
+  end
+
+  defp to_search_result_map(result_map, attribute_name, attribute_value, attribute_list) do
+    attribute_components = String.split(attribute_name, "_")
+
+    if Enum.count(attribute_components) > 1 do
+      {key_type, attribute_components} = List.pop_at(attribute_components, -1)
+
+      attribute_name = Enum.join(attribute_components, "_")
+
+      if attribute_list == :all or attribute_name in attribute_list do
+        case key_type do
+          "register" ->
+            Map.put(result_map, attribute_name, attribute_value)
+
+          "flag" ->
+            Map.put(result_map, attribute_name, attribute_value == "true")
+
+          "counter" ->
+            {int, _} = Integer.parse(attribute_value)
+
+            Map.put(result_map, attribute_name, int)
+
+          "set" ->
+            Map.put(result_map,
+                    attribute_name,
+                    [attribute_value] ++ (result_map[attribute_name] || []))
+
+          _ ->
+            result_map
+        end
+      else
+        result_map
+      end
+    else
+      result_map
+    end
+  end
+
+  defp build_riak_filter({:attrExp, attrExp}) do
+    build_riak_filter(attrExp)
+  end
+
+  defp build_riak_filter({:and, lhs, rhs}) do
+    build_riak_filter(lhs) <> " AND " <> build_riak_filter(rhs)
+  end
+
+  defp build_riak_filter({:or, lhs, rhs}) do
+    "(" <> build_riak_filter(lhs) <> ") OR (" <> build_riak_filter(rhs) <> ")"
+  end
+
+  defp build_riak_filter({:not, filter}) do
+    "(*:* NOT " <> build_riak_filter(filter) <> ")"
+  end
+
+  defp build_riak_filter({:pr, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }})
+  do
+    attribute <> "_register:* OR " <>
+    attribute <> "_flag:* OR " <>
+    attribute <> "_counter:* OR " <>
+    attribute <> "_set:*"
+  end
+
+  defp build_riak_filter({:eq, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, value}) when is_binary(value)
+  do
+    attribute <> "_register:" <> to_string(value) <> " OR " <>
+    attribute <> "_set:" <> to_string(value) # special case to handle equality in sets
+  end
+
+  defp build_riak_filter({:eq, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, value})
+  do
+    riak_attribute_name(attribute, value) <> ":" <> to_string(value)
+  end
+
+  defp build_riak_filter({:ne, attribute_path, value})
+  do
+    "(*:* NOT " <> build_riak_filter({:eq, attribute_path, value}) <> ")"
+  end
+
+  defp build_riak_filter({:ge, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, value})
+  do
+    riak_attribute_name(attribute, value) <> ":[" <> to_string(value) <> " TO *]"
+  end
+
+  defp build_riak_filter({:le, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, value})
+  do
+    riak_attribute_name(attribute, value) <> ":[* TO " <> to_string(value) <> "]"
+  end
+
+  defp build_riak_filter({:gt, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  } = attribute_path, value})
+  do
+    riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
+    "(*:* NOT " <> build_riak_filter({:le, attribute_path, value}) <> ")"
+  end
+
+  defp build_riak_filter({:lt, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  } = attribute_path, value})
+  do
+    riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
+    "(*:* NOT " <> build_riak_filter({:ge, attribute_path, value}) <> ")"
+  end
+
+  defp build_riak_filter({:co, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, value}) when is_binary(attribute)
+  do
+    attribute <> "_register:*" <> to_string(value) <> "* OR " <>
+      attribute <> "_set:*" <> to_string(value) <> "*" # special case to handle equality in sets
+  end
+
+  defp build_riak_filter({:sw, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, value}) when is_binary(attribute)
+  do
+    attribute <> "_register:" <> to_string(value) <> "* OR " <>
+      attribute <> "_set:" <> to_string(value) <> "*" # special case to handle equality in sets
+  end
+
+  defp build_riak_filter({:ew, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, value}) when is_binary(attribute)
+  do
+    attribute <> "_register:*" <> to_string(value) <> " OR " <>
+      attribute <> "_set:*" <> to_string(value) # special case to handle equality in sets
+  end
+
+  defp riak_attribute_name(name, value) when is_binary(value), do: name <> "_register"
+  defp riak_attribute_name(name, value) when is_boolean(value), do: name <> "_flag"
+  defp riak_attribute_name(name, value) when is_integer(value), do: name <> "_counter"
+
+  @spec to_riak_crdt(AttributeRepository.attribute_data_type()) :: any()
+
+  defp to_riak_crdt(value) when is_binary(value) do
+    Riak.CRDT.Register.new(value)
+  end
+
+  defp to_riak_crdt(true) do
+    Riak.CRDT.Flag.new()
+    |> Riak.CRDT.Flag.enable()
+  end
+
+  defp to_riak_crdt(false) do
+    Riak.CRDT.Flag.new()
+    |> Riak.CRDT.Flag.disable()
+  end
+
+  defp to_riak_crdt(value) when is_integer(value) do
+    Riak.CRDT.Counter.new()
+    |> Riak.CRDT.Counter.increment(value)
+  end
+
+  defp to_riak_crdt(nil) do
+    Riak.CRDT.Register.new(nil)
+  end
+
+  defp to_riak_crdt(value) when is_list(value) do
+    Enum.reduce(
+      value,
+      Riak.CRDT.Set.new(),
+      fn
+        list_element, acc ->
+          Riak.CRDT.Set.put(acc, list_element)
+      end
+    )
+  end
+
+  @spec bucket_name(AttributeRepository.run_opts()) :: String.t()
+  defp bucket_name(run_opts), do: "attribute_repository_" <> to_string(run_opts[:instance])
+
+  @spec index_name(AttributeRepository.run_opts()) :: String.t()
+  defp index_name(run_opts), do: "attribute_repository_" <> to_string(run_opts[:instance]) <> "_index"
+
+  defp map_entry_data_type_of_key(obj, key) do
+    keys = Riak.CRDT.Map.keys(obj)
+
+    case Enum.find(
+      keys,
+      fn
+        {^key, _} ->
+          true
+
+        _ ->
+          false
+      end
+    ) do
+      {^key, type} ->
+        type
+
+      _ ->
+        nil
+    end
   end
 end
