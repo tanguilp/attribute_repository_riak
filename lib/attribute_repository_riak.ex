@@ -36,7 +36,12 @@ defmodule AttributeRepositoryRiak do
   @impl AttributeRepository.Install
 
   def install(run_opts, _init_opts) do
-    :ok = Riak.Search.Index.put(index_name(run_opts))
+    :ok = Riak.Search.Schema.create(
+      schema_name(run_opts),
+      :code.priv_dir(:attribute_repository_riak) ++ '/schema.xml' |> File.read!()
+    )
+
+    :ok = Riak.Search.Index.put(index_name(run_opts), schema_name(run_opts))
 
     :ok = Riak.Search.Index.set({run_opts[:bucket_type], bucket_name(run_opts)},
                                 index_name(run_opts))
@@ -58,7 +63,13 @@ defmodule AttributeRepositoryRiak do
             fn
               {{attribute_name, _attribute_type}, attribute_value}, acc ->
                 if attributes == :all or attribute_name in attributes do
-                  Map.put(acc, attribute_name, attribute_value)
+                  if String.ends_with?(attribute_name, "_date") do
+                    Map.put(acc,
+                            String.slice(attribute_name, 0..-6),
+                            elem(DateTime.from_iso8601(attribute_value), 1))
+                  else
+                    Map.put(acc, attribute_name, attribute_value)
+                  end
                 else
                   acc
                 end
@@ -95,6 +106,9 @@ defmodule AttributeRepositoryRiak do
         resource,
         new_base_obj,
         fn
+          {key, %DateTime{} = value}, acc ->
+            Riak.CRDT.Map.put(acc, key <> "_date", to_riak_crdt(value))
+
           {key, value}, acc ->
             Riak.CRDT.Map.put(acc, key, to_riak_crdt(value))
         end
@@ -213,6 +227,7 @@ defmodule AttributeRepositoryRiak do
 
   def search(filter, attributes, run_opts) do
 
+    IO.inspect(build_riak_filter(filter))
     case Riak.Search.query(index_name(run_opts), build_riak_filter(filter)) do
       {:ok, {:search_results, result_list, _, _}} ->
         for {_index_name, result_attributes} <- result_list do
@@ -243,36 +258,35 @@ defmodule AttributeRepositoryRiak do
   end
 
   defp to_search_result_map(result_map, attribute_name, attribute_value, attribute_list) do
-    attribute_components = String.split(attribute_name, "_")
-
-    if Enum.count(attribute_components) > 1 do
-      {key_type, attribute_components} = List.pop_at(attribute_components, -1)
-
-      attribute_name = Enum.join(attribute_components, "_")
-
-      if attribute_list == :all or attribute_name in attribute_list do
-        case key_type do
-          "register" ->
-            Map.put(result_map, attribute_name, attribute_value)
-
-          "flag" ->
-            Map.put(result_map, attribute_name, attribute_value == "true")
-
-          "counter" ->
-            {int, _} = Integer.parse(attribute_value)
-
-            Map.put(result_map, attribute_name, int)
-
-          "set" ->
-            Map.put(result_map,
+    res = Regex.run(~r/(.*)_(register|flag|counter|set|date_register)/U,
                     attribute_name,
-                    [attribute_value] ++ (result_map[attribute_name] || []))
+                    capture: :all_but_first)
 
-          _ ->
-            result_map
-        end
-      else
-        result_map
+    if res != nil and (attribute_list == :all or List.first(res) in attribute_list) do
+      case res do
+        [attribute_name, "register"] ->
+          Map.put(result_map, attribute_name, attribute_value)
+
+        [attribute_name, "flag"] ->
+          Map.put(result_map, attribute_name, attribute_value == "true")
+
+        [attribute_name, "counter"] ->
+          {int, _} = Integer.parse(attribute_value)
+
+          Map.put(result_map, attribute_name, int)
+
+        [attribute_name, "set"] ->
+          Map.put(result_map,
+                  attribute_name,
+                  [attribute_value] ++ (result_map[attribute_name] || []))
+
+        [attribute_name, "date_register"] ->
+          {:ok, date, _} = DateTime.from_iso8601(attribute_value)
+
+          Map.put(result_map, attribute_name, date)
+
+        _ ->
+          result_map
       end
     else
       result_map
@@ -301,6 +315,7 @@ defmodule AttributeRepositoryRiak do
   }})
   do
     attribute <> "_register:* OR " <>
+    attribute <> "_date_register:* OR " <>
     attribute <> "_flag:* OR " <>
     attribute <> "_counter:* OR " <>
     attribute <> "_set:*"
@@ -323,6 +338,19 @@ defmodule AttributeRepositoryRiak do
     riak_attribute_name(attribute, value) <> ":" <> to_string(value)
   end
 
+  defp build_riak_filter({:eq, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, %DateTime{} = value})
+  do
+    riak_attribute_name(attribute, value) <>
+    ":[" <>
+    DateTime.to_iso8601(value) <>
+    " TO " <>
+    DateTime.to_iso8601(value) <>
+    "]"
+  end
+
   defp build_riak_filter({:ne, attribute_path, value})
   do
     "(*:* NOT " <> build_riak_filter({:eq, attribute_path, value}) <> ")"
@@ -336,12 +364,28 @@ defmodule AttributeRepositoryRiak do
     riak_attribute_name(attribute, value) <> ":[" <> to_string(value) <> " TO *]"
   end
 
+  defp build_riak_filter({:ge, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, %DateTime{} = value})
+  do
+    riak_attribute_name(attribute, value) <> ":[" <> DateTime.to_iso8601(value) <> " TO *]"
+  end
+
   defp build_riak_filter({:le, %AttributePath{
     attribute: attribute,
     sub_attribute: nil
   }, value}) when is_binary(value) or is_integer(value)
   do
     riak_attribute_name(attribute, value) <> ":[* TO " <> to_string(value) <> "]"
+  end
+
+  defp build_riak_filter({:le, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, %DateTime{} = value})
+  do
+    riak_attribute_name(attribute, value) <> ":[* TO " <> DateTime.to_iso8601(value) <> "]"
   end
 
   defp build_riak_filter({:gt, %AttributePath{
@@ -353,10 +397,28 @@ defmodule AttributeRepositoryRiak do
     "(*:* NOT " <> build_riak_filter({:le, attribute_path, value}) <> ")"
   end
 
+  defp build_riak_filter({:gt, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  } = attribute_path, %DateTime{} = value})
+  do
+    riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
+    "(*:* NOT " <> build_riak_filter({:le, attribute_path, value}) <> ")"
+  end
+
   defp build_riak_filter({:lt, %AttributePath{
     attribute: attribute,
     sub_attribute: nil
   } = attribute_path, value}) when is_binary(value) or is_integer(value)
+  do
+    riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
+    "(*:* NOT " <> build_riak_filter({:ge, attribute_path, value}) <> ")"
+  end
+
+  defp build_riak_filter({:lt, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  } = attribute_path, %DateTime{} = value})
   do
     riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
     "(*:* NOT " <> build_riak_filter({:ge, attribute_path, value}) <> ")"
@@ -393,10 +455,6 @@ defmodule AttributeRepositoryRiak do
     raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
   end
 
-  defp build_riak_filter({_, _, %DateTime{}}) do
-    raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
-  end
-
   defp build_riak_filter({_, _, {:binary_data, _}}) do
     raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
   end
@@ -406,6 +464,7 @@ defmodule AttributeRepositoryRiak do
   end
 
   defp riak_attribute_name(name, value) when is_binary(value), do: name <> "_register"
+  defp riak_attribute_name(name, %DateTime{}), do: name <> "_date_register"
   defp riak_attribute_name(name, value) when is_boolean(value), do: name <> "_flag"
   defp riak_attribute_name(name, value) when is_integer(value), do: name <> "_counter"
 
@@ -430,6 +489,12 @@ defmodule AttributeRepositoryRiak do
     |> Riak.CRDT.Counter.increment(value)
   end
 
+  defp to_riak_crdt(%DateTime{} = value) do
+    value
+    |> DateTime.to_iso8601()
+    |> Riak.CRDT.Register.new()
+  end
+
   defp to_riak_crdt(value) when is_list(value) do
     Enum.reduce(
       value,
@@ -446,6 +511,9 @@ defmodule AttributeRepositoryRiak do
 
   @spec index_name(AttributeRepository.run_opts()) :: String.t()
   defp index_name(run_opts), do: "attribute_repository_" <> to_string(run_opts[:instance]) <> "_index"
+
+  @spec schema_name(AttributeRepository.run_opts()) :: String.t()
+  def schema_name(run_opts), do: "attribute_repository_" <> to_string(run_opts[:instance]) <> "_schema"
 
   defp map_entry_data_type_of_key(obj, key) do
     keys = Riak.CRDT.Map.keys(obj)

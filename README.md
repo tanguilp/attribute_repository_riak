@@ -58,7 +58,7 @@ The `AttributeRepository.run_opts()` for this module are the following:
 - [x] `boolean()`
 - [ ] `float()`
 - [x] `integer()`
-- [ ] `DateTime.t()`
+- [x] `DateTime.t()`
 - [ ] `AttributeRepository.binary_data()`
 - [ ] `AttributeRepository.ref()`
 - [ ] `nil`
