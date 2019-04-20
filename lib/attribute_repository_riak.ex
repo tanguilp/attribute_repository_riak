@@ -68,7 +68,13 @@ defmodule AttributeRepositoryRiak do
                             String.slice(attribute_name, 0..-6),
                             elem(DateTime.from_iso8601(attribute_value), 1))
                   else
-                    Map.put(acc, attribute_name, attribute_value)
+                    if String.ends_with?(attribute_name, "_binarydata") do
+                    Map.put(acc,
+                            String.slice(attribute_name, 0..-12),
+                            {:binary_data, attribute_value})
+                    else
+                      Map.put(acc, attribute_name, attribute_value)
+                    end
                   end
                 else
                   acc
@@ -106,11 +112,8 @@ defmodule AttributeRepositoryRiak do
         resource,
         new_base_obj,
         fn
-          {key, %DateTime{} = value}, acc ->
-            Riak.CRDT.Map.put(acc, key <> "_date", to_riak_crdt(value))
-
           {key, value}, acc ->
-            Riak.CRDT.Map.put(acc, key, to_riak_crdt(value))
+            pre_insert_map_put(acc, key, value)
         end
       )
 
@@ -134,10 +137,11 @@ defmodule AttributeRepositoryRiak do
             obj,
             fn
               {:add, attribute_name, attribute_value}, acc ->
-                Riak.CRDT.Map.put(acc, attribute_name, to_riak_crdt(attribute_value))
+                pre_insert_map_put(acc, attribute_name, attribute_value)
 
               {:replace, attribute_name, value}, acc ->
                 try do
+                  # sets can only be for strings - so no need to handle date, etc. here
                   Riak.CRDT.Map.update(acc,
                                        :set,
                                        attribute_name,
@@ -157,11 +161,12 @@ defmodule AttributeRepositoryRiak do
                                        end)
                 rescue
                   _ ->
-                    Riak.CRDT.Map.put(acc, attribute_name, to_riak_crdt(value))
+                    pre_insert_map_put(acc, attribute_name, value)
                 end
 
               {:replace, attribute_name, old_value, new_value}, acc ->
                 try do
+                  # sets can only be for strings - so no need to handle date, etc. here
                   Riak.CRDT.Map.update(acc,
                                        :set,
                                        attribute_name,
@@ -173,7 +178,7 @@ defmodule AttributeRepositoryRiak do
                                        end)
                 rescue
                   _ ->
-                    Riak.CRDT.Map.put(acc, attribute_name, to_riak_crdt(new_value))
+                    pre_insert_map_put(acc, attribute_name, new_value)
                 end
 
               {:delete, attribute_name}, acc ->
@@ -217,6 +222,35 @@ defmodule AttributeRepositoryRiak do
     end
   end
 
+  defp pre_insert_map_put(map, attribute_name, %DateTime{} = value) do
+    map
+    |> crdt_map_delete_if_present(attribute_name)
+    |> crdt_map_delete_if_present(attribute_name <> "_binarydata")
+    |> Riak.CRDT.Map.put(attribute_name <> "_date", to_riak_crdt(value))
+  end
+
+  defp pre_insert_map_put(map, attribute_name, {:binary_data, binary_data}) do
+    map
+    |> crdt_map_delete_if_present(attribute_name)
+    |> crdt_map_delete_if_present(attribute_name <> "_date")
+    |> Riak.CRDT.Map.put(attribute_name <> "_binarydata", to_riak_crdt(binary_data))
+  end
+
+  defp pre_insert_map_put(map, attribute_name, value) do
+    map
+    |> crdt_map_delete_if_present(attribute_name <> "_binarydata")
+    |> crdt_map_delete_if_present(attribute_name <> "_date")
+    |> Riak.CRDT.Map.put(attribute_name, to_riak_crdt(value))
+  end
+
+  defp crdt_map_delete_if_present(map, attribute_name) do
+    if Riak.CRDT.Map.has_key?(map, attribute_name) do
+      Riak.CRDT.Map.delete(map, {attribute_name, :register})
+    else
+      map
+    end
+  end
+
   @impl AttributeRepository.Write
 
   def delete(resource_id, run_opts) do
@@ -226,8 +260,6 @@ defmodule AttributeRepositoryRiak do
   @impl AttributeRepository.Search
 
   def search(filter, attributes, run_opts) do
-
-    IO.inspect(build_riak_filter(filter))
     case Riak.Search.query(index_name(run_opts), build_riak_filter(filter)) do
       {:ok, {:search_results, result_list, _, _}} ->
         for {_index_name, result_attributes} <- result_list do
@@ -258,7 +290,7 @@ defmodule AttributeRepositoryRiak do
   end
 
   defp to_search_result_map(result_map, attribute_name, attribute_value, attribute_list) do
-    res = Regex.run(~r/(.*)_(register|flag|counter|set|date_register)/U,
+    res = Regex.run(~r/(.*)_(register|flag|counter|set|date_register|binarydata_register)/U,
                     attribute_name,
                     capture: :all_but_first)
 
@@ -284,6 +316,9 @@ defmodule AttributeRepositoryRiak do
           {:ok, date, _} = DateTime.from_iso8601(attribute_value)
 
           Map.put(result_map, attribute_name, date)
+
+        [attribute_name, "binarydata_register"] ->
+          Map.put(result_map, attribute_name, {:binary_data, attribute_value})
 
         _ ->
           result_map
@@ -316,6 +351,7 @@ defmodule AttributeRepositoryRiak do
   do
     attribute <> "_register:* OR " <>
     attribute <> "_date_register:* OR " <>
+    attribute <> "_binarydata_register:* OR " <>
     attribute <> "_flag:* OR " <>
     attribute <> "_counter:* OR " <>
     attribute <> "_set:*"
@@ -349,6 +385,14 @@ defmodule AttributeRepositoryRiak do
     " TO " <>
     DateTime.to_iso8601(value) <>
     "]"
+  end
+
+  defp build_riak_filter({:eq, %AttributePath{
+    attribute: attribute,
+    sub_attribute: nil
+  }, {:binary_data, value}})
+  do
+    riak_attribute_name(attribute, value) <> ":" <> to_string(value)
   end
 
   defp build_riak_filter({:ne, attribute_path, value})
@@ -463,6 +507,7 @@ defmodule AttributeRepositoryRiak do
     raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
   end
 
+  defp riak_attribute_name(name, {:binary_data, _value}), do: name <> "_binarydata_register"
   defp riak_attribute_name(name, value) when is_binary(value), do: name <> "_register"
   defp riak_attribute_name(name, %DateTime{}), do: name <> "_date_register"
   defp riak_attribute_name(name, value) when is_boolean(value), do: name <> "_flag"
@@ -495,6 +540,10 @@ defmodule AttributeRepositoryRiak do
     |> Riak.CRDT.Register.new()
   end
 
+  defp to_riak_crdt({:binary_data, value}) do
+    Riak.CRDT.Register.new(value)
+  end
+
   defp to_riak_crdt(value) when is_list(value) do
     Enum.reduce(
       value,
@@ -513,7 +562,7 @@ defmodule AttributeRepositoryRiak do
   defp index_name(run_opts), do: "attribute_repository_" <> to_string(run_opts[:instance]) <> "_index"
 
   @spec schema_name(AttributeRepository.run_opts()) :: String.t()
-  def schema_name(run_opts), do: "attribute_repository_" <> to_string(run_opts[:instance]) <> "_schema"
+  def schema_name(_run_opts), do: "attribute_repository_schema"
 
   defp map_entry_data_type_of_key(obj, key) do
     keys = Riak.CRDT.Map.keys(obj)

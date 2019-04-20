@@ -7,7 +7,7 @@ Riak implementation of `AttributeRepository`
 ```elixir
 def deps do
   [
-    {:attribute_repository_riak, github: "tanguilp/attribute_repository_riak", tag: "master"}
+    {:attribute_repository_riak, github: "tanguilp/attribute_repository_riak", tag: "v0.1.0"}
   ]
 end
 ```
@@ -31,6 +31,25 @@ config :pooler, pools: [
   ]
 ]
 ```
+
+You might want to configure Riak by adding a new bucket type:
+```sh
+$ sudo riak-admin bucket-type create attr_rep '{"props":{"datatype":"map", "backend":"leveldb_mult"}}'
+attr_rep created
+
+$ sudo riak-admin bucket-type activate attr_rep
+attr_rep has been activated
+```
+
+When calling the `AttributeRepositoryRiak.install/2` function, a new schema is created
+(with specific indexing settings for dates) and a search index using this schema is created
+at the bucket level. For instance, with `run_opts = [instance: :user, bucket_type: "attr_rep"]`,
+the following configuration is set:
+- creation of the `attribute_repository_schema` (shared)
+- creation of the `attribute_repository_user_index`
+- association of that index to the `"user"` bucket in the `"attr_rep"` bucket type
+  - The index is *not* associated with the whole bucket type, so as not to mix results between
+  different buckets
 
 ## Resource id
 
@@ -59,7 +78,8 @@ The `AttributeRepository.run_opts()` for this module are the following:
 - [ ] `float()`
 - [x] `integer()`
 - [x] `DateTime.t()`
-- [ ] `AttributeRepository.binary_data()`
+- [x] `AttributeRepository.binary_data()`
+  - Note: fields of this type are not searchable, and are not returned by the search
 - [ ] `AttributeRepository.ref()`
 - [ ] `nil`
 - [ ] `AttributeRepository.object_attribute()` or *complex attribute* (note: this is not
