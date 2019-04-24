@@ -36,20 +36,24 @@ defmodule AttributeRepositoryRiak do
   @impl AttributeRepository.Install
 
   def install(run_opts, _init_opts) do
-    :ok = Riak.Search.Schema.create(
-      schema_name(run_opts),
-      :code.priv_dir(:attribute_repository_riak) ++ '/schema.xml' |> File.read!()
-    )
+    :ok =
+      Riak.Search.Schema.create(
+        schema_name(run_opts),
+        (:code.priv_dir(:attribute_repository_riak) ++ '/schema.xml') |> File.read!()
+      )
 
     :ok = Riak.Search.Index.put(index_name(run_opts), schema_name(run_opts))
 
-    :ok = Riak.Search.Index.set({run_opts[:bucket_type], bucket_name(run_opts)},
-                                index_name(run_opts))
+    :ok =
+      Riak.Search.Index.set(
+        {run_opts[:bucket_type], bucket_name(run_opts)},
+        index_name(run_opts)
+      )
   end
 
   @impl AttributeRepository.Read
 
-  def get(resource_id, attributes, run_opts) do
+  def get(resource_id, result_attributes, run_opts) do
     case Riak.find(run_opts[:bucket_type], bucket_name(run_opts), resource_id) do
       nil ->
         {:error, AttributeRepository.Read.NotFoundError.exception("Entry not found")}
@@ -62,19 +66,42 @@ defmodule AttributeRepositoryRiak do
             %{},
             fn
               {{attribute_name, _attribute_type}, attribute_value}, acc ->
-                if attributes == :all or attribute_name in attributes do
-                  if String.ends_with?(attribute_name, "_date") do
-                    Map.put(acc,
-                            String.slice(attribute_name, 0..-6),
-                            elem(DateTime.from_iso8601(attribute_value), 1))
-                  else
-                    if String.ends_with?(attribute_name, "_binarydata") do
-                    Map.put(acc,
-                            String.slice(attribute_name, 0..-12),
-                            {:binary_data, attribute_value})
-                    else
+                {attribute_name, attribute_type} =
+                  case Regex.run(~r/^(.*)(_integer|_date|_binarydata)?$/U, attribute_name,
+                         capture: :all_but_first
+                       ) do
+                    [attribute_name, "_integer"] ->
+                      {attribute_name, :integer}
+
+                    [attribute_name, "_date"] ->
+                      {attribute_name, :date}
+
+                    [attribute_name, "_binarydata"] ->
+                      {attribute_name, :binary_data}
+
+                    [attribute_name] ->
+                      {attribute_name, :string}
+                  end
+
+                if result_attributes == :all or attribute_name in result_attributes do
+                  case attribute_type do
+                    :string ->
                       Map.put(acc, attribute_name, attribute_value)
-                    end
+
+                    :date ->
+                      Map.put(
+                        acc,
+                        attribute_name,
+                        elem(DateTime.from_iso8601(attribute_value), 1)
+                      )
+
+                    :binary_data ->
+                      Map.put(acc, attribute_name, {:binary_data, attribute_value})
+
+                    :integer ->
+                      {int, _} = Integer.parse(attribute_value)
+
+                      Map.put(acc, attribute_name, int)
                   end
                 else
                   acc
@@ -91,7 +118,7 @@ defmodule AttributeRepositoryRiak do
     new_base_obj =
       case Riak.find(run_opts[:bucket_type], bucket_name(run_opts), resource_id) do
         obj when not is_nil(obj) ->
-          #FIXME: mwe may not need to keep the same object in the case of repacement:
+          # FIXME: mwe may not need to keep the same object in the case of repacement:
           # just deleting it and creating a new could be enough?
           # There would be however a short time with no object
           Enum.reduce(
@@ -142,23 +169,25 @@ defmodule AttributeRepositoryRiak do
               {:replace, attribute_name, value}, acc ->
                 try do
                   # sets can only be for strings - so no need to handle date, etc. here
-                  Riak.CRDT.Map.update(acc,
-                                       :set,
-                                       attribute_name,
-                                       fn
-                                         set ->
-                                           set =
-                                             Enum.reduce(
-                                               Riak.CRDT.Set.value(set),
-                                               set,
-                                               fn
-                                                 val, acc ->
-                                                   Riak.CRDT.Set.delete(acc, val)
-                                               end
-                                             )
+                  Riak.CRDT.Map.update(
+                    acc,
+                    :set,
+                    attribute_name,
+                    fn
+                      set ->
+                        set =
+                          Enum.reduce(
+                            Riak.CRDT.Set.value(set),
+                            set,
+                            fn
+                              val, acc ->
+                                Riak.CRDT.Set.delete(acc, val)
+                            end
+                          )
 
-                                           Riak.CRDT.Set.put(set, value)
-                                       end)
+                        Riak.CRDT.Set.put(set, value)
+                    end
+                  )
                 rescue
                   _ ->
                     pre_insert_map_put(acc, attribute_name, value)
@@ -167,15 +196,17 @@ defmodule AttributeRepositoryRiak do
               {:replace, attribute_name, old_value, new_value}, acc ->
                 try do
                   # sets can only be for strings - so no need to handle date, etc. here
-                  Riak.CRDT.Map.update(acc,
-                                       :set,
-                                       attribute_name,
-                                       fn
-                                         set ->
-                                           set
-                                           |> Riak.CRDT.Set.delete(old_value)
-                                           |> Riak.CRDT.Set.put(new_value)
-                                       end)
+                  Riak.CRDT.Map.update(
+                    acc,
+                    :set,
+                    attribute_name,
+                    fn
+                      set ->
+                        set
+                        |> Riak.CRDT.Set.delete(old_value)
+                        |> Riak.CRDT.Set.put(new_value)
+                    end
+                  )
                 rescue
                   _ ->
                     pre_insert_map_put(acc, attribute_name, new_value)
@@ -192,13 +223,15 @@ defmodule AttributeRepositoryRiak do
 
               {:delete, attribute_name, attribute_value}, acc ->
                 try do
-                  Riak.CRDT.Map.update(acc,
-                                       :set,
-                                       attribute_name,
-                                       fn
-                                         obj ->
-                                           Riak.CRDT.Set.delete(obj, attribute_value)
-                                       end)
+                  Riak.CRDT.Map.update(
+                    acc,
+                    :set,
+                    attribute_name,
+                    fn
+                      obj ->
+                        Riak.CRDT.Set.delete(obj, attribute_value)
+                    end
+                  )
                 rescue
                   _ ->
                     acc
@@ -206,10 +239,12 @@ defmodule AttributeRepositoryRiak do
             end
           )
 
-        case Riak.update(modified_obj,
-                         run_opts[:bucket_type],
-                         bucket_name(run_opts),
-                         resource_id) do
+        case Riak.update(
+               modified_obj,
+               run_opts[:bucket_type],
+               bucket_name(run_opts),
+               resource_id
+             ) do
           :ok ->
             :ok
 
@@ -222,9 +257,18 @@ defmodule AttributeRepositoryRiak do
     end
   end
 
+  defp pre_insert_map_put(map, attribute_name, value) when is_integer(value) do
+    map
+    |> crdt_map_delete_if_present(attribute_name)
+    |> crdt_map_delete_if_present(attribute_name <> "_binarydata")
+    |> crdt_map_delete_if_present(attribute_name <> "_date")
+    |> Riak.CRDT.Map.put(attribute_name <> "_integer", to_riak_crdt(value))
+  end
+
   defp pre_insert_map_put(map, attribute_name, %DateTime{} = value) do
     map
     |> crdt_map_delete_if_present(attribute_name)
+    |> crdt_map_delete_if_present(attribute_name <> "_integer")
     |> crdt_map_delete_if_present(attribute_name <> "_binarydata")
     |> Riak.CRDT.Map.put(attribute_name <> "_date", to_riak_crdt(value))
   end
@@ -232,12 +276,14 @@ defmodule AttributeRepositoryRiak do
   defp pre_insert_map_put(map, attribute_name, {:binary_data, binary_data}) do
     map
     |> crdt_map_delete_if_present(attribute_name)
+    |> crdt_map_delete_if_present(attribute_name <> "_integer")
     |> crdt_map_delete_if_present(attribute_name <> "_date")
     |> Riak.CRDT.Map.put(attribute_name <> "_binarydata", to_riak_crdt(binary_data))
   end
 
   defp pre_insert_map_put(map, attribute_name, value) do
     map
+    |> crdt_map_delete_if_present(attribute_name <> "_integer")
     |> crdt_map_delete_if_present(attribute_name <> "_binarydata")
     |> crdt_map_delete_if_present(attribute_name <> "_date")
     |> Riak.CRDT.Map.put(attribute_name, to_riak_crdt(value))
@@ -290,9 +336,12 @@ defmodule AttributeRepositoryRiak do
   end
 
   defp to_search_result_map(result_map, attribute_name, attribute_value, attribute_list) do
-    res = Regex.run(~r/(.*)_(register|flag|counter|set|date_register|binarydata_register)/U,
-                    attribute_name,
-                    capture: :all_but_first)
+    res =
+      Regex.run(
+        ~r/(.*)_(register|flag|counter|set|integer_register|date_register|binarydata_register)/U,
+        attribute_name,
+        capture: :all_but_first
+      )
 
     if res != nil and (attribute_list == :all or List.first(res) in attribute_list) do
       case res do
@@ -308,9 +357,16 @@ defmodule AttributeRepositoryRiak do
           Map.put(result_map, attribute_name, int)
 
         [attribute_name, "set"] ->
-          Map.put(result_map,
-                  attribute_name,
-                  [attribute_value] ++ (result_map[attribute_name] || []))
+          Map.put(
+            result_map,
+            attribute_name,
+            [attribute_value] ++ (result_map[attribute_name] || [])
+          )
+
+        [attribute_name, "integer_register"] ->
+          {int, _} = Integer.parse(attribute_value)
+
+          Map.put(result_map, attribute_name, int)
 
         [attribute_name, "date_register"] ->
           {:ok, date, _} = DateTime.from_iso8601(attribute_value)
@@ -333,7 +389,7 @@ defmodule AttributeRepositoryRiak do
   end
 
   defp build_riak_filter({:and, lhs, rhs}) do
-    build_riak_filter(lhs) <> " AND " <> build_riak_filter(rhs)
+    "(" <> build_riak_filter(lhs) <> " AND " <> build_riak_filter(rhs) <> ")"
   end
 
   defp build_riak_filter({:or, lhs, rhs}) do
@@ -344,162 +400,215 @@ defmodule AttributeRepositoryRiak do
     "(*:* NOT " <> build_riak_filter(filter) <> ")"
   end
 
-  defp build_riak_filter({:pr, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }})
-  do
-    attribute <> "_register:* OR " <>
-    attribute <> "_date_register:* OR " <>
-    attribute <> "_binarydata_register:* OR " <>
-    attribute <> "_flag:* OR " <>
-    attribute <> "_counter:* OR " <>
-    attribute <> "_set:*"
+  defp build_riak_filter(
+         {:pr,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }}
+       ) do
+    attribute <>
+      "_register:* OR " <>
+      attribute <>
+      "_integer_register:* OR " <>
+      attribute <>
+      "_date_register:* OR " <>
+      attribute <>
+      "_binarydata_register:* OR " <>
+      attribute <> "_flag:* OR " <> attribute <> "_counter:* OR " <> attribute <> "_set:*"
   end
 
-  defp build_riak_filter({:eq, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, value}) when is_binary(value)
-  do
-    attribute <> "_register:" <> to_string(value) <> " OR " <>
-    attribute <> "_set:" <> to_string(value) # special case to handle equality in sets
+  defp build_riak_filter(
+         {:eq,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, value}
+       )
+       when is_binary(value) do
+    # special case to handle equality in sets
+    attribute <>
+      "_register:" <>
+      to_escaped_string(value) <> " OR " <> attribute <> "_set:" <> to_escaped_string(value)
   end
 
-  defp build_riak_filter({:eq, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, value}) when is_boolean(value) or is_integer(value)
-  do
+  defp build_riak_filter(
+         {:eq,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, value}
+       )
+       when is_boolean(value) or is_integer(value) do
     riak_attribute_name(attribute, value) <> ":" <> to_string(value)
   end
 
-  defp build_riak_filter({:eq, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, %DateTime{} = value})
-  do
+  defp build_riak_filter(
+         {:eq,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, %DateTime{} = value}
+       ) do
     riak_attribute_name(attribute, value) <>
-    ":[" <>
-    DateTime.to_iso8601(value) <>
-    " TO " <>
-    DateTime.to_iso8601(value) <>
-    "]"
+      ":[" <> DateTime.to_iso8601(value) <> " TO " <> DateTime.to_iso8601(value) <> "]"
   end
 
-  defp build_riak_filter({:eq, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, {:binary_data, value}})
-  do
+  defp build_riak_filter(
+         {:eq,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, {:binary_data, value}}
+       ) do
     riak_attribute_name(attribute, value) <> ":" <> to_string(value)
   end
 
-  defp build_riak_filter({:ne, attribute_path, value})
-  do
+  defp build_riak_filter({:ne, attribute_path, value}) do
     "(*:* NOT " <> build_riak_filter({:eq, attribute_path, value}) <> ")"
   end
 
-  defp build_riak_filter({:ge, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, value}) when is_binary(value) or is_integer(value)
-  do
-    riak_attribute_name(attribute, value) <> ":[" <> to_string(value) <> " TO *]"
+  defp build_riak_filter(
+         {:ge,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, value}
+       )
+       when is_binary(value) or is_integer(value) do
+    riak_attribute_name(attribute, value) <> ":[" <> to_escaped_string(value) <> " TO *]"
   end
 
-  defp build_riak_filter({:ge, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, %DateTime{} = value})
-  do
+  defp build_riak_filter(
+         {:ge,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, %DateTime{} = value}
+       ) do
     riak_attribute_name(attribute, value) <> ":[" <> DateTime.to_iso8601(value) <> " TO *]"
   end
 
-  defp build_riak_filter({:le, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, value}) when is_binary(value) or is_integer(value)
-  do
-    riak_attribute_name(attribute, value) <> ":[* TO " <> to_string(value) <> "]"
+  defp build_riak_filter(
+         {:le,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, value}
+       )
+       when is_binary(value) or is_integer(value) do
+    riak_attribute_name(attribute, value) <> ":[* TO " <> to_escaped_string(value) <> "]"
   end
 
-  defp build_riak_filter({:le, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, %DateTime{} = value})
-  do
+  defp build_riak_filter(
+         {:le,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, %DateTime{} = value}
+       ) do
     riak_attribute_name(attribute, value) <> ":[* TO " <> DateTime.to_iso8601(value) <> "]"
   end
 
-  defp build_riak_filter({:gt, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  } = attribute_path, value}) when is_binary(value) or is_integer(value)
-  do
-    riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
-    "(*:* NOT " <> build_riak_filter({:le, attribute_path, value}) <> ")"
+  defp build_riak_filter(
+         {:gt,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          } = attribute_path, value}
+       )
+       when is_binary(value) or is_integer(value) do
+    # attribute does exist
+    "(" <>
+      riak_attribute_name(attribute, value) <>
+      ":* AND " <> "(*:* NOT " <> build_riak_filter({:le, attribute_path, value}) <> "))"
   end
 
-  defp build_riak_filter({:gt, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  } = attribute_path, %DateTime{} = value})
-  do
-    riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
-    "(*:* NOT " <> build_riak_filter({:le, attribute_path, value}) <> ")"
+  defp build_riak_filter(
+         {:gt,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          } = attribute_path, %DateTime{} = value}
+       ) do
+    # attribute does exist
+    "(" <>
+      riak_attribute_name(attribute, value) <>
+      ":* AND " <> "(*:* NOT " <> build_riak_filter({:le, attribute_path, value}) <> "))"
   end
 
-  defp build_riak_filter({:lt, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  } = attribute_path, value}) when is_binary(value) or is_integer(value)
-  do
-    riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
-    "(*:* NOT " <> build_riak_filter({:ge, attribute_path, value}) <> ")"
+  defp build_riak_filter(
+         {:lt,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          } = attribute_path, value}
+       )
+       when is_binary(value) or is_integer(value) do
+    # attribute does exist
+    "(" <>
+      riak_attribute_name(attribute, value) <>
+      ":* AND " <> "(*:* NOT " <> build_riak_filter({:ge, attribute_path, value}) <> "))"
   end
 
-  defp build_riak_filter({:lt, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  } = attribute_path, %DateTime{} = value})
-  do
-    riak_attribute_name(attribute, value) <> ":* AND " <> # attribute does exist
-    "(*:* NOT " <> build_riak_filter({:ge, attribute_path, value}) <> ")"
+  defp build_riak_filter(
+         {:lt,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          } = attribute_path, %DateTime{} = value}
+       ) do
+    # attribute does exist
+    "(" <>
+      riak_attribute_name(attribute, value) <>
+      ":* AND " <> "(*:* NOT " <> build_riak_filter({:ge, attribute_path, value}) <> "))"
   end
 
-  defp build_riak_filter({:co, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, value}) when is_binary(attribute)
-  do
-    attribute <> "_register:*" <> to_string(value) <> "* OR " <>
-      attribute <> "_set:*" <> to_string(value) <> "*" # special case to handle equality in sets
+  defp build_riak_filter(
+         {:co,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, value}
+       )
+       when is_binary(attribute) do
+    # special case to handle equality in sets
+    attribute <>
+      "_register:*" <>
+      to_escaped_string(value) <>
+      "* OR " <> attribute <> "_set:*" <> to_escaped_string(value) <> "*"
   end
 
-  defp build_riak_filter({:sw, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, value}) when is_binary(attribute)
-  do
-    attribute <> "_register:" <> to_string(value) <> "* OR " <>
-      attribute <> "_set:" <> to_string(value) <> "*" # special case to handle equality in sets
+  defp build_riak_filter(
+         {:sw,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, value}
+       )
+       when is_binary(attribute) do
+    # special case to handle equality in sets
+    attribute <>
+      "_register:" <>
+      to_escaped_string(value) <>
+      "* OR " <> attribute <> "_set:" <> to_escaped_string(value) <> "*"
   end
 
-  defp build_riak_filter({:ew, %AttributePath{
-    attribute: attribute,
-    sub_attribute: nil
-  }, value}) when is_binary(attribute)
-  do
-    attribute <> "_register:*" <> to_string(value) <> " OR " <>
-      attribute <> "_set:*" <> to_string(value) # special case to handle equality in sets
+  defp build_riak_filter(
+         {:ew,
+          %AttributePath{
+            attribute: attribute,
+            sub_attribute: nil
+          }, value}
+       )
+       when is_binary(attribute) do
+    # special case to handle equality in sets
+    attribute <>
+      "_register:*" <>
+      to_escaped_string(value) <> " OR " <> attribute <> "_set:*" <> to_escaped_string(value)
   end
 
   defp build_riak_filter({_, _, value}) when is_float(value) or is_nil(value) do
-    raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
-  end
-
-  defp build_riak_filter({_, _, {:binary_data, _}}) do
     raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
   end
 
@@ -507,11 +616,11 @@ defmodule AttributeRepositoryRiak do
     raise AttributeRepository.UnsupportedError, message: "Unsupported data type"
   end
 
-  defp riak_attribute_name(name, {:binary_data, _value}), do: name <> "_binarydata_register"
   defp riak_attribute_name(name, value) when is_binary(value), do: name <> "_register"
+  defp riak_attribute_name(name, value) when is_integer(value), do: name <> "_integer_register"
   defp riak_attribute_name(name, %DateTime{}), do: name <> "_date_register"
+  defp riak_attribute_name(name, {:binary_data, _value}), do: name <> "_binarydata_register"
   defp riak_attribute_name(name, value) when is_boolean(value), do: name <> "_flag"
-  defp riak_attribute_name(name, value) when is_integer(value), do: name <> "_counter"
 
   @spec to_riak_crdt(AttributeRepository.attribute_data_type()) :: any()
 
@@ -530,8 +639,9 @@ defmodule AttributeRepositoryRiak do
   end
 
   defp to_riak_crdt(value) when is_integer(value) do
-    Riak.CRDT.Counter.new()
-    |> Riak.CRDT.Counter.increment(value)
+    value
+    |> to_string()
+    |> Riak.CRDT.Register.new()
   end
 
   defp to_riak_crdt(%DateTime{} = value) do
@@ -555,11 +665,18 @@ defmodule AttributeRepositoryRiak do
     )
   end
 
+  defp to_escaped_string(value) do
+    value
+    |> to_string()
+    |> String.replace(" ", "\\ ")
+  end
+
   @spec bucket_name(AttributeRepository.run_opts()) :: String.t()
   defp bucket_name(run_opts), do: "attribute_repository_" <> to_string(run_opts[:instance])
 
   @spec index_name(AttributeRepository.run_opts()) :: String.t()
-  defp index_name(run_opts), do: "attribute_repository_" <> to_string(run_opts[:instance]) <> "_index"
+  defp index_name(run_opts),
+    do: "attribute_repository_" <> to_string(run_opts[:instance]) <> "_index"
 
   @spec schema_name(AttributeRepository.run_opts()) :: String.t()
   def schema_name(_run_opts), do: "attribute_repository_schema"
@@ -568,15 +685,15 @@ defmodule AttributeRepositoryRiak do
     keys = Riak.CRDT.Map.keys(obj)
 
     case Enum.find(
-      keys,
-      fn
-        {^key, _} ->
-          true
+           keys,
+           fn
+             {^key, _} ->
+               true
 
-        _ ->
-          false
-      end
-    ) do
+             _ ->
+               false
+           end
+         ) do
       {^key, type} ->
         type
 

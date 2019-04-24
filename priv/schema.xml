@@ -100,6 +100,7 @@
 
    <!-- AttributeRepositoryRiak datatypes embedded fields -->
    <dynamicField name="*_date_register" type="tdate"  indexed="true" stored="true" multiValued="false" />
+   <dynamicField name="*_integer_register" type="int"  indexed="true" stored="true" multiValued="false" />
    <dynamicField name="*_binarydata_register" type="binary"  indexed="false" stored="false" multiValued="false" />
 
    <!-- Riak datatypes embedded fields -->
