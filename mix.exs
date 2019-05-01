@@ -25,7 +25,7 @@ defmodule AttributeRepositoryRiak.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:attribute_repository, github: "tanguilp/attribute_repository", tag: "v0.1.0"},
+      {:attribute_repository, github: "tanguilp/attribute_repository", tag: "v0.1.1"},
       {:riak, github: "tanguilp/riak-elixir-client"},
       {:dialyxir, "~> 1.0.0-rc.4", only: [:dev], runtime: false},
       {:ex_doc, "~> 0.19", only: :dev, runtime: false}
